@@ -17,10 +17,25 @@ name: FableWatch heartbeat
 # Order matters: health is read BEFORE our own tick, so it reflects the PRIMARY
 # cron's health rather than our tick refreshing it.
 #
-# KNOWN GAP (2026-08-20, not introduced here): /api/health now answers
-# {"ok":true,"db":false,"note":"no database configured"} - HTTP 200 regardless of
-# staleness, so half 1 is a false green. It cannot fail. Fix belongs in the app:
-# /api/health must 503 when the last successful poll is older than its window.
+# READ THIS BEFORE TRUSTING THIS WORKFLOW (established 2026-08-20):
+# Half 1 is currently GREEN BY CONSTRUCTION and is NOT coverage. /api/health answers
+# {"ok":true,"db":false,"note":"no database configured"} - HTTP 200 unconditionally -
+# so the dead-man's-switch cannot fail no matter what breaks.
+#
+# This is NOT a regression and must NOT be "fixed" by making /api/health 503 on stale.
+# docs/DE-NEON-2026-07-21.md in the fablewatch repo deliberately retired the Fable
+# return-monitor subsystem: DATABASE_URL was removed from every Vercel env, and the
+# dbReady() guards make the monitor no-op by design. A 503-on-stale would page forever
+# about a subsystem that was switched off on purpose.
+#
+# The real defect is that this ALARM outlived the subsystem it watched. Keep the
+# workflow (the backup tick half still does real work) but do not count half 1 as
+# monitoring. A genuine proof-of-life would have to watch the freshness of something
+# the tick actually writes to Blob, read by CDN HEAD to respect the zero-metered-ops
+# invariant in blobstore.ts. No such public surface exists yet (/api/aw/liveness 404s,
+# /api/social-proof carries no timestamps) and /api/status is not a substitute - its
+# fallbackStatus() stamps checkedAt with now() on every call, so it always looks fresh.
+# That design call is Mark's, not this file's.
 
 on:
   schedule:
