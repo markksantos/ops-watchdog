@@ -1,0 +1,44 @@
+name: Quoter uptime
+
+# Moved out of markksantos/markstudios-quoter on 2026-08-20. It is a pure external
+# HTTP probe - it touches no private code and needs no repo write - so it has no
+# business consuming metered private-repo Actions minutes. See this repo's README.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+env:
+  BASE_URL: https://start.markstudios.com
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Health endpoint returns 200
+        run: |
+          for attempt in 1 2 3; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$BASE_URL/api/health" || echo 000)
+            echo "attempt $attempt: /api/health -> $code"
+            if [ "$code" = "200" ]; then healthy=1; break; fi
+            sleep 10
+          done
+          if [ "${healthy:-0}" != "1" ]; then
+            echo "::error::Health check failed (last status $code) for $BASE_URL/api/health"
+            exit 1
+          fi
+
+      - name: Landing page loads
+        run: |
+          for attempt in 1 2 3; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$BASE_URL/" || echo 000)
+            echo "attempt $attempt: / -> $code"
+            if [ "$code" = "200" ]; then up=1; break; fi
+            sleep 10
+          done
+          if [ "${up:-0}" != "1" ]; then
+            echo "::error::Landing page failed (last status $code) for $BASE_URL/"
+            exit 1
+          fi

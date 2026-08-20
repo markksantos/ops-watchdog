@@ -15,9 +15,17 @@ GitHub Actions secrets, which are never exposed to forks or pull requests.
 
 ## Sweeps
 
-| Workflow | Target | Cadence |
-|---|---|---|
-| `strategy-pipeline-watchdog.yml` | `strategy.markstudios.com/api/pipeline/cron` | `*/5` (GitHub throttles to ~30 min in practice) |
+| Workflow | Target | Cadence | Moved from |
+|---|---|---|---|
+| `strategy-pipeline-watchdog.yml` | `strategy.markstudios.com/api/pipeline/cron` | `*/5` | `strategy-generator` |
+| `quoter-uptime.yml` | `start.markstudios.com` health + landing | `*/15` | `markstudios-quoter` |
+| `fablewatch-heartbeat.yml` | `fablewatch.com` health + backup tick | `*/30` | `fablewatch` |
+
+The rule for what belongs here: **an external HTTP call that needs no private code
+and no repo write.** Jobs that check out a private repo, build it, or commit back to
+it (e.g. fablewatch's `AW autopilot`) must stay where they are — moving them would
+mean putting a token with private-repo write access into a public repo, which trades
+a billing problem for a security one. Don't.
 
 ## Cadence caveat
 

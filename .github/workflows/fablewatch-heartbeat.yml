@@ -1,0 +1,65 @@
+name: FableWatch heartbeat
+
+# Moved out of markksantos/fablewatch on 2026-08-20, unchanged in behaviour.
+#
+# It is a dead-man's-switch for FableWatch's primary cron, and on 2026-08-19 it
+# died for the dumbest possible reason: it shared a metered Actions minute pool
+# with every other private repo, that pool ran dry, and the account's $0 Actions
+# budget refused to start it. A monitor that fails silently when the account is
+# busy is not a monitor. Both halves are external HTTP calls, so they belong here
+# where minutes are unmetered.
+#
+#   1. DEAD-MAN'S-SWITCH - GET the public /api/health. Failing step -> GitHub
+#      emails the repo owner.
+#   2. BACKUP TICK - drive /api/cron/tick so detection/notify/reap limp along at
+#      30-min granularity if the primary is down. Skips cleanly with no secret.
+#
+# Order matters: health is read BEFORE our own tick, so it reflects the PRIMARY
+# cron's health rather than our tick refreshing it.
+#
+# KNOWN GAP (2026-08-20, not introduced here): /api/health now answers
+# {"ok":true,"db":false,"note":"no database configured"} - HTTP 200 regardless of
+# staleness, so half 1 is a false green. It cannot fail. Fix belongs in the app:
+# /api/health must 503 when the last successful poll is older than its window.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: fablewatch-heartbeat
+  cancel-in-progress: false
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dead-man's-switch — alert if the monitor poll is stale
+        run: |
+          check() { curl -s -o /dev/null -w "%{http_code}" --max-time 15 https://fablewatch.com/api/health; }
+          code=$(check)
+          # One retry to avoid flapping on a transient network/edge blip.
+          if [ "$code" != "200" ]; then
+            echo "health first read: HTTP $code — retrying in 20s…"
+            sleep 20
+            code=$(check)
+          fi
+          echo "health: HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::error title=FableWatch heartbeat::/api/health returned $code — the monitor poll is STALE. The primary cron is likely down. Return detection, notifications, and VPS reaping are NOT running. Investigate now."
+            exit 1
+          fi
+          echo "Primary cron healthy."
+
+      - name: Backup heartbeat — drive the cron tick
+        if: always()
+        run: |
+          if [ -z "${{ secrets.FABLEWATCH_CRON_SECRET }}" ]; then
+            echo "FABLEWATCH_CRON_SECRET not set — skipping backup tick (alert half still active)."
+            exit 0
+          fi
+          curl -s -X GET https://fablewatch.com/api/cron/tick \
+            -H "Authorization: Bearer ${{ secrets.FABLEWATCH_CRON_SECRET }}" \
+            --max-time 280 \
+            -o /dev/null -w "backup tick: HTTP %{http_code}\n"
