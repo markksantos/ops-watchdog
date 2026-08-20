@@ -83,9 +83,15 @@ jobs:
             -H "Authorization: Bearer ${{ secrets.FABLEWATCH_CRON_SECRET }}" \
             --max-time 280 -o /tmp/tick.json -w "%{http_code}")
           echo "backup tick: HTTP $code"
-          echo "--- body ---"
-          head -c 2000 /tmp/tick.json || true
-          echo
+          # This is a PUBLIC repo, so the authenticated endpoint's response body is
+          # only printed when something is wrong and the detail is worth the
+          # disclosure. It is counters today, but do not routinely publish the
+          # internals of an authed route to a world-readable log.
+          if [ "$code" != "200" ] || ! grep -q '"ok":true' /tmp/tick.json; then
+            echo "--- body (failure detail) ---"
+            head -c 2000 /tmp/tick.json || true
+            echo
+          fi
           if [ "$code" != "200" ]; then
             echo "::error title=FableWatch heartbeat::/api/cron/tick returned $code. ArtificialWatch launch detection, fan-out, liveness probes and store-health paging all run inside this tick — none of them are running."
             exit 1
