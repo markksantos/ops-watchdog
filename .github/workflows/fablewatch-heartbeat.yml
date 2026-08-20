@@ -67,14 +67,33 @@ jobs:
           fi
           echo "Primary cron healthy."
 
-      - name: Backup heartbeat — drive the cron tick
+      # This step is now the ONLY half that can actually fail, so it has to mean
+      # something. It used to send the body to /dev/null and print the status
+      # without ever failing - a 401, a 500, or an ok:false body all looked
+      # identical to success. Now the status and the body are both asserted.
+      - name: Backup heartbeat — drive the cron tick, and assert it worked
         if: always()
         run: |
+          set -uo pipefail
           if [ -z "${{ secrets.FABLEWATCH_CRON_SECRET }}" ]; then
-            echo "FABLEWATCH_CRON_SECRET not set — skipping backup tick (alert half still active)."
-            exit 0
+            echo "::error title=FableWatch heartbeat::FABLEWATCH_CRON_SECRET is missing — the backup tick cannot run and this workflow is monitoring nothing."
+            exit 1
           fi
-          curl -s -X GET https://fablewatch.com/api/cron/tick \
+          code=$(curl -s -X GET https://fablewatch.com/api/cron/tick \
             -H "Authorization: Bearer ${{ secrets.FABLEWATCH_CRON_SECRET }}" \
-            --max-time 280 \
-            -o /dev/null -w "backup tick: HTTP %{http_code}\n"
+            --max-time 280 -o /tmp/tick.json -w "%{http_code}")
+          echo "backup tick: HTTP $code"
+          echo "--- body ---"
+          head -c 2000 /tmp/tick.json || true
+          echo
+          if [ "$code" != "200" ]; then
+            echo "::error title=FableWatch heartbeat::/api/cron/tick returned $code. ArtificialWatch launch detection, fan-out, liveness probes and store-health paging all run inside this tick — none of them are running."
+            exit 1
+          fi
+          # The route answers 200 with {"ok":true,...}; ok:false means a subsystem
+          # aborted the request even though the HTTP layer was fine.
+          if ! grep -q '"ok":true' /tmp/tick.json; then
+            echo "::error title=FableWatch heartbeat::/api/cron/tick answered 200 but the body is not ok:true — a subsystem inside the tick failed."
+            exit 1
+          fi
+          echo "Tick ran and reported ok."
