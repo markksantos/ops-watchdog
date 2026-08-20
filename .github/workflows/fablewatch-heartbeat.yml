@@ -1,41 +1,31 @@
 name: FableWatch heartbeat
 
-# Moved out of markksantos/fablewatch on 2026-08-20, unchanged in behaviour.
+# Moved out of markksantos/fablewatch on 2026-08-20.
 #
-# It is a dead-man's-switch for FableWatch's primary cron, and on 2026-08-19 it
-# died for the dumbest possible reason: it shared a metered Actions minute pool
-# with every other private repo, that pool ran dry, and the account's $0 Actions
-# budget refused to start it. A monitor that fails silently when the account is
-# busy is not a monitor. Both halves are external HTTP calls, so they belong here
-# where minutes are unmetered.
+# It died that day for the dumbest possible reason: it shared a metered Actions
+# minute pool with every other private repo, the pool ran dry, and the account's
+# $0 Actions budget refused to start it. A monitor that fails silently when the
+# account is busy is not a monitor. Both halves are external HTTP calls, so they
+# belong here where minutes are unmetered.
 #
-#   1. DEAD-MAN'S-SWITCH - GET the public /api/health. Failing step -> GitHub
+#   1. DEAD-MAN'S-SWITCH - assert /api/liveness is fresh. Failing step -> GitHub
 #      emails the repo owner.
-#   2. BACKUP TICK - drive /api/cron/tick so detection/notify/reap limp along at
-#      30-min granularity if the primary is down. Skips cleanly with no secret.
+#   2. BACKUP TICK - drive /api/cron/tick so ArtificialWatch keeps running at
+#      30-min granularity if the primary is down.
 #
-# Order matters: health is read BEFORE our own tick, so it reflects the PRIMARY
-# cron's health rather than our tick refreshing it.
-#
-# READ THIS BEFORE TRUSTING THIS WORKFLOW (established 2026-08-20):
-# Half 1 is currently GREEN BY CONSTRUCTION and is NOT coverage. /api/health answers
-# {"ok":true,"db":false,"note":"no database configured"} - HTTP 200 unconditionally -
-# so the dead-man's-switch cannot fail no matter what breaks.
-#
-# This is NOT a regression and must NOT be "fixed" by making /api/health 503 on stale.
-# docs/DE-NEON-2026-07-21.md in the fablewatch repo deliberately retired the Fable
-# return-monitor subsystem: DATABASE_URL was removed from every Vercel env, and the
-# dbReady() guards make the monitor no-op by design. A 503-on-stale would page forever
-# about a subsystem that was switched off on purpose.
-#
-# The real defect is that this ALARM outlived the subsystem it watched. Keep the
-# workflow (the backup tick half still does real work) but do not count half 1 as
-# monitoring. A genuine proof-of-life would have to watch the freshness of something
-# the tick actually writes to Blob, read by CDN HEAD to respect the zero-metered-ops
-# invariant in blobstore.ts. No such public surface exists yet (/api/aw/liveness 404s,
-# /api/social-proof carries no timestamps) and /api/status is not a substitute - its
-# fallbackStatus() stamps checkedAt with now() on every call, so it always looks fresh.
-# That design call is Mark's, not this file's.
+# HISTORY, so nobody reintroduces either bug:
+# Half 1 originally probed /api/health and was GREEN BY CONSTRUCTION. That endpoint
+# answers {"ok":true,"db":false} unconditionally because docs/DE-NEON-2026-07-21.md
+# deliberately retired the Fable return-monitor subsystem - DATABASE_URL was pulled
+# from every env and dbReady() guards make it no-op. It is NOT a regression and must
+# never be "fixed" with a 503-on-stale; that would page forever about something
+# switched off on purpose. The defect was that the ALARM outlived its subsystem.
+# It now watches /api/liveness, which is real, and asserts age rather than status
+# for the reason spelled out above that step.
+# Half 2 used to send its body to /dev/null and never fail, so a 401, a 500 and an
+# ok:false body were indistinguishable from success. It asserts now.
+# /api/status is NOT a substitute for either: fallbackStatus() stamps checkedAt with
+# now() on every call, so it always looks fresh and proves nothing.
 
 on:
   schedule:
@@ -50,22 +40,49 @@ jobs:
   heartbeat:
     runs-on: ubuntu-latest
     steps:
-      - name: Dead-man's-switch — alert if the monitor poll is stale
+      # THE REAL DEAD-MAN'S-SWITCH (replaced the /api/health probe 2026-08-20).
+      #
+      # /api/health could not fail - it is an intentional dormant stub post-De-Neon,
+      # so this half was green by construction. /api/liveness is the opposite: the
+      # tick stamps Blob, and never-stamped / unreadable / corrupt / unconfigured all
+      # answer 503. Positive evidence only.
+      #
+      # WHY THIS DOES NOT JUST `curl -fsS`, which would look sufficient:
+      # the backup tick below CALLS /api/cron/tick, which STAMPS liveness. The stamp
+      # is gated to every 15 min and goes stale at 45 min, but this workflow ticks
+      # every 30. So if the 1-minute Vercel primary died completely, our own backup
+      # tick would keep the stamp under 45 minutes forever and /api/liveness would
+      # answer 200 for eternity. The monitor would be held up by its own backup -
+      # exactly the false-green class this repo exists to stop.
+      #
+      # So assert the AGE, not just the status. A healthy primary stamps every 15 min,
+      # so age stays ~<16 min. If only our backup is stamping, age at probe time is at
+      # least our own interval (30 min, and GitHub really delivers ~36). 25 minutes
+      # sits cleanly between the two. This step MUST stay before the backup tick.
+      - name: Dead-man's-switch — is the PRIMARY tick still stamping?
         run: |
-          check() { curl -s -o /dev/null -w "%{http_code}" --max-time 15 https://fablewatch.com/api/health; }
-          code=$(check)
-          # One retry to avoid flapping on a transient network/edge blip.
+          set -uo pipefail
+          code=$(curl -s -o /tmp/live.json -w "%{http_code}" --max-time 20 \
+            https://fablewatch.com/api/liveness || echo 000)
+          echo "liveness: HTTP $code"
+          cat /tmp/live.json 2>/dev/null || true
+          echo
           if [ "$code" != "200" ]; then
-            echo "health first read: HTTP $code — retrying in 20s…"
-            sleep 20
-            code=$(check)
-          fi
-          echo "health: HTTP $code"
-          if [ "$code" != "200" ]; then
-            echo "::error title=FableWatch heartbeat::/api/health returned $code — the monitor poll is STALE. The primary cron is likely down. Return detection, notifications, and VPS reaping are NOT running. Investigate now."
+            reason=$(jq -r '.reason // "unknown"' /tmp/live.json 2>/dev/null || echo unknown)
+            echo "::error title=FableWatch liveness::/api/liveness returned $code (reason: $reason). The tick is not stamping. ArtificialWatch launch detection, fan-out, liveness probes and store-health paging are NOT running."
             exit 1
           fi
-          echo "Primary cron healthy."
+          age=$(jq -r '.ageSeconds // empty' /tmp/live.json 2>/dev/null)
+          if [ -z "$age" ]; then
+            echo "::error title=FableWatch liveness::200 but no ageSeconds in the body - cannot prove freshness, so treating as failed."
+            exit 1
+          fi
+          # 25 min: above the 15-min stamp gate, below our own 30-min backup interval.
+          if [ "$age" -ge 1500 ]; then
+            echo "::error title=FableWatch liveness::stamp is ${age}s old. The 1-minute Vercel primary is NOT stamping - only this workflow's 30-minute backup tick is keeping the endpoint under its 45-minute stale threshold. /api/liveness still answers 200, which is why this checks age rather than status."
+            exit 1
+          fi
+          echo "Primary tick healthy - stamp is ${age}s old."
 
       # This step is now the ONLY half that can actually fail, so it has to mean
       # something. It used to send the body to /dev/null and print the status
