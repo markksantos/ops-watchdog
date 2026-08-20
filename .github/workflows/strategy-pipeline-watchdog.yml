@@ -1,0 +1,53 @@
+name: Strategy pipeline watchdog
+
+# Pops the Strategy Generator pipeline queue so a dead self-fire chain never
+# strands a paid job. Lives in a PUBLIC repo on purpose: private-repo Actions
+# minutes are metered against one shared account pool, and a $0 account budget
+# took this watchdog down for 14.5h on 2026-08-19. Public repos are unmetered.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: strategy-pipeline-watchdog
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sweep pipeline queue
+        run: |
+          set -euo pipefail
+          code=$(curl -s -o /tmp/resp.json -w "%{http_code}" --max-time 60 \
+            -H "Authorization: Bearer ${{ secrets.STRATEGY_CRON_SECRET }}" \
+            "https://strategy.markstudios.com/api/pipeline/cron")
+          cat /tmp/resp.json
+          echo
+          test "$code" = "200"
+
+      # GitHub silently disables scheduled workflows after 60 days of repo
+      # inactivity. Workflow runs do NOT count as activity - only commits do.
+      # One dated line a day keeps the schedule alive forever.
+      - name: Heartbeat
+        run: |
+          set -euo pipefail
+          today=$(date -u +%F)
+          if [ -f heartbeat.txt ] && grep -q "^$today" heartbeat.txt; then
+            echo "heartbeat already recorded for $today"
+            exit 0
+          fi
+          echo "$today swept" >> heartbeat.txt
+          git config user.name  "ops-watchdog"
+          git config user.email "ops-watchdog@users.noreply.github.com"
+          git add heartbeat.txt
+          git commit -m "heartbeat $today"
+          git push || true
