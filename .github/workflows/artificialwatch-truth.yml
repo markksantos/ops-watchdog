@@ -1,0 +1,156 @@
+name: ArtificialWatch truth check
+
+# Added 2026-09-21.
+#
+# WHAT THIS IS. artificialwatch.com sells one claim: its numbers are READ from
+# primary sources, not estimated. So the failure that actually costs it something
+# is not downtime — it is the site confidently publishing a number that is wrong.
+# That has happened repeatedly: a board rendering 56 cards while its own copy said
+# it tracked 88; a published subscriber count of 306 when ~266 existed; five model
+# pages serving market percentages frozen for 53 days.
+#
+# WHY IT LIVES HERE, in a PUBLIC repo. Actions minutes are unmetered here. The
+# private fablewatch repo shares one metered pool across the whole account, and
+# when that pool ran dry on 2026-08-19 every private workflow — including the
+# heartbeat that was supposed to notice — stopped at once. A monitor that dies
+# with the thing it monitors is not a monitor.
+#
+# WHY IT CHECKS ONLY PUBLIC SURFACES. It has no repo access and no secrets, and it
+# does not need any: every assertion below is something a stranger with a browser
+# could verify. That is the point — it tests what a READER sees, not what the
+# build believed it wrote.
+#
+# WHAT IT DELIBERATELY DOES NOT CHECK — each of these was considered and rejected
+# because it produces false alarms, which is how a monitor gets muted:
+#   · wire-item age — a quiet week with no model launches is legitimate, and the
+#     feed staying still is the correct behaviour, not a fault.
+#   · public/ commit age — needs private repo access, and the cadence is genuinely
+#     irregular (measured gaps of 25-58h are normal).
+#   · a hardcoded expected card count — it would need editing on every launch, and
+#     a check nobody maintains is a check that gets deleted.
+# Instead it asserts INTERNAL CONSISTENCY, which is true at every size: whatever
+# number the page claims to track, it must render that many cards.
+
+on:
+  schedule:
+    # Twice a day. This catches a wrong number before it sits for a week; it is
+    # not trying to catch it within the minute, because nothing here is an
+    # outage. GitHub's scheduler drifts by hours under load (measured on the
+    # sibling repo: an "hourly" cron really firing every 2.5-5h), so treat these
+    # as "about twice a day" and never as a timestamp.
+    - cron: "20 7,19 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: artificialwatch-truth
+  cancel-in-progress: false
+
+jobs:
+  truth:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. The site answers at all. A bare reachability check, kept separate so a
+      #    DNS/TLS/deploy failure reports as itself rather than as a parse error
+      #    three steps later.
+      - name: The landing page is reachable
+        run: |
+          set -uo pipefail
+          code=$(curl -sS -o /tmp/landing.html -w '%{http_code}' --max-time 30 \
+                 "https://artificialwatch.com/?cb=${GITHUB_RUN_ID}")
+          bytes=$(wc -c < /tmp/landing.html | tr -d ' ')
+          echo "http=$code bytes=$bytes"
+          if [ "$code" != "200" ]; then
+            echo "::error::artificialwatch.com answered HTTP $code"
+            exit 1
+          fi
+          # A 200 that returns a stub is the failure mode a status check misses.
+          if [ "$bytes" -lt 50000 ]; then
+            echo "::error::landing page is only $bytes bytes - that is not the real page"
+            exit 1
+          fi
+
+      # 2. THE REAL CHECK. The board must render as many cards as the page says it
+      #    tracks. This is the defect class that has actually shipped here, and it
+      #    is invisible to every green build: the count and the cards come from
+      #    different places in the generator, so they can disagree while both
+      #    "work". Asserting their EQUALITY needs no knowledge of the right value.
+      - name: The board renders as many models as it claims to track
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          html = open('/tmp/landing.html', encoding='utf-8', errors='ignore').read()
+
+          cards = html.count('class="wcard')
+          # Every phrasing the page uses for its own size. Anchored on the words
+          # around the number, not on markup, because the generator rewrites the
+          # bold tags and also emits a tag-stripped copy inside JSON-LD.
+          claims = set()
+          for pat in (r'full watchlist tracks\s*(?:<[^>]+>)?\s*(\d+)',
+                      r'(?:<[^>]+>)?\s*(\d+)\s*(?:</[^>]+>)?\s*on the watchlist',
+                      r'full watchlist\s*(?:<[^>]+>)?\s*(\d+)'):
+              claims.update(int(m) for m in re.findall(pat, html))
+
+          print(f"cards rendered: {cards}")
+          print(f"counts claimed: {sorted(claims) or 'none found'}")
+
+          if cards == 0:
+              print("::error::no watchlist cards rendered at all")
+              sys.exit(1)
+          if not claims:
+              # Not a failure: the copy may legitimately stop stating a count.
+              # Say so loudly rather than passing silently on a check that has
+              # quietly stopped checking anything.
+              print("::warning::page states no watchlist count - this check is now inert, "
+                    "confirm that is intended or re-point it")
+              sys.exit(0)
+
+          wrong = sorted(n for n in claims if n != cards)
+          if wrong:
+              print(f"::error::the page claims to track {wrong} but renders {cards} cards. "
+                    f"A reader can count them. Rebuild the static site, or fix the count source.")
+              sys.exit(1)
+          print(f"consistent: claims and cards both {cards}")
+          PY
+
+      # 3. The published subscriber number is derived, not fabricated. The route's
+      #    own documented contract is that it returns 0 and the UI renders nothing
+      #    rather than a made-up figure — so a 0 here is not "no subscribers", it
+      #    is the hourly true-up having died or the store being unreadable. Either
+      #    is worth knowing, and neither shows up anywhere else.
+      - name: The published subscriber count is alive
+        run: |
+          set -uo pipefail
+          code=$(curl -sS -o /tmp/stats.json -w '%{http_code}' --max-time 30 \
+                 "https://artificialwatch.com/api/aw/stats?cb=${GITHUB_RUN_ID}")
+          echo "http=$code body=$(cat /tmp/stats.json)"
+          [ "$code" = "200" ] || { echo "::error::/api/aw/stats answered $code"; exit 1; }
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open('/tmp/stats.json'))
+          n = d.get('onBoard')
+          if not isinstance(n, int):
+              print(f"::error::onBoard is {n!r}, not a number"); sys.exit(1)
+          if n <= 0:
+              print("::error::onBoard is 0 - the route returns 0 rather than guess, so this "
+                    "means the hourly true-up stopped writing or the store is unreadable")
+              sys.exit(1)
+          print(f"onBoard={n}")
+          PY
+
+      # 4. The sitemap is the SEO surface and the thing Google is told to crawl. A
+      #    truncated or empty one is silent: nothing 404s, traffic just stops
+      #    arriving weeks later.
+      - name: The sitemap is intact
+        run: |
+          set -uo pipefail
+          code=$(curl -sS -o /tmp/sm.xml -w '%{http_code}' --max-time 30 \
+                 "https://artificialwatch.com/aw-sitemap.xml?cb=${GITHUB_RUN_ID}")
+          urls=$(grep -c '<loc>' /tmp/sm.xml || true)
+          echo "http=$code urls=$urls"
+          [ "$code" = "200" ] || { echo "::error::sitemap answered $code"; exit 1; }
+          # The board alone is >100 pages; anything under 50 means it was written
+          # from a partial build.
+          if [ "${urls:-0}" -lt 50 ]; then
+            echo "::error::sitemap lists only $urls URLs - that is a truncated build"
+            exit 1
+          fi
