@@ -55,11 +55,16 @@ jobs:
       - name: The landing page is reachable
         run: |
           set -uo pipefail
-          code=$(curl -sS -o /tmp/landing.html -w '%{http_code}' --max-time 30 \
+          code=$(curl -sS -D /tmp/landing.hdr -o /tmp/landing.html -w '%{http_code}' --max-time 30 \
                  "https://artificialwatch.com/?cb=${GITHUB_RUN_ID}")
           bytes=$(wc -c < /tmp/landing.html | tr -d ' ')
           echo "http=$code bytes=$bytes"
           if [ "$code" != "200" ]; then
+            # Say WHICH layer refused. The zone is Cloudflare-proxied in front of
+            # Vercel, and a bot challenge on the runner's datacenter IP looks
+            # identical to an outage from the status code alone.
+            grep -iE '^(server|cf-mitigated|cf-ray|x-vercel-mitigated|x-vercel-id):' /tmp/landing.hdr || true
+            echo "title: $(grep -oiE '<title>[^<]*' /tmp/landing.html | head -1 | sed 's/<title>//I')"
             echo "::error::artificialwatch.com answered HTTP $code"
             exit 1
           fi
