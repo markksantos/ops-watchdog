@@ -48,24 +48,48 @@ concurrency:
 jobs:
   truth:
     runs-on: ubuntu-latest
+    env:
+      # Read content from the Vercel origin, not through Cloudflare. The zone has
+      # had Bot Fight Mode on since 2026-09-28, which serves this runner's
+      # datacenter IP a JS challenge ("Just a moment...", 403), and on the free
+      # plan Bot Fight Mode cannot be exempted by a WAF skip rule. Cloudflare
+      # does not cache the HTML (cf-cache-status: DYNAMIC), so the origin serves
+      # the same bytes a reader gets. Measured identical, 144 cards both ways.
+      ORIGIN: --connect-to artificialwatch.com:443:cname.vercel-dns.com:443
     steps:
+      # 0. The public front door answers. Through Cloudflare, like a reader. A bot
+      #    challenge counts as up: it is the edge working as configured, and a
+      #    browser passes it. Anything else (5xx, a 52x origin error, a timeout)
+      #    fails and names the layer that refused.
+      - name: The front door answers
+        run: |
+          set -uo pipefail
+          code=$(curl -sS -D /tmp/edge.hdr -o /tmp/edge.html -w '%{http_code}' --max-time 30 \
+                 "https://artificialwatch.com/?cb=${GITHUB_RUN_ID}")
+          echo "http=$code"
+          [ "$code" = "200" ] && exit 0
+          grep -iE '^(server|cf-mitigated|cf-ray|x-vercel-mitigated|x-vercel-id):' /tmp/edge.hdr || true
+          echo "title: $(grep -oiE '<title>[^<]*' /tmp/edge.html | head -1 | sed 's/<title>//I')"
+          if grep -qiE '^cf-mitigated: *challenge' /tmp/edge.hdr; then
+            echo "::notice::Cloudflare bot-challenged this runner (Bot Fight Mode) - the edge is up"
+            exit 0
+          fi
+          echo "::error::artificialwatch.com answered HTTP $code through Cloudflare"
+          exit 1
+
       # 1. The site answers at all. A bare reachability check, kept separate so a
       #    DNS/TLS/deploy failure reports as itself rather than as a parse error
       #    three steps later.
       - name: The landing page is reachable
         run: |
           set -uo pipefail
-          code=$(curl -sS -D /tmp/landing.hdr -o /tmp/landing.html -w '%{http_code}' --max-time 30 \
+          code=$(curl -sS $ORIGIN -D /tmp/landing.hdr -o /tmp/landing.html -w '%{http_code}' --max-time 30 \
                  "https://artificialwatch.com/?cb=${GITHUB_RUN_ID}")
           bytes=$(wc -c < /tmp/landing.html | tr -d ' ')
           echo "http=$code bytes=$bytes"
           if [ "$code" != "200" ]; then
-            # Say WHICH layer refused. The zone is Cloudflare-proxied in front of
-            # Vercel, and a bot challenge on the runner's datacenter IP looks
-            # identical to an outage from the status code alone.
-            grep -iE '^(server|cf-mitigated|cf-ray|x-vercel-mitigated|x-vercel-id):' /tmp/landing.hdr || true
-            echo "title: $(grep -oiE '<title>[^<]*' /tmp/landing.html | head -1 | sed 's/<title>//I')"
-            echo "::error::artificialwatch.com answered HTTP $code"
+            grep -iE '^(server|x-vercel-mitigated|x-vercel-id):' /tmp/landing.hdr || true
+            echo "::error::artificialwatch.com answered HTTP $code at the Vercel origin"
             exit 1
           fi
           # A 200 that returns a stub is the failure mode a status check misses.
@@ -125,7 +149,7 @@ jobs:
       - name: The published subscriber count is alive
         run: |
           set -uo pipefail
-          code=$(curl -sS -o /tmp/stats.json -w '%{http_code}' --max-time 30 \
+          code=$(curl -sS $ORIGIN -o /tmp/stats.json -w '%{http_code}' --max-time 30 \
                  "https://artificialwatch.com/api/aw/stats?cb=${GITHUB_RUN_ID}")
           echo "http=$code body=$(cat /tmp/stats.json)"
           [ "$code" = "200" ] || { echo "::error::/api/aw/stats answered $code"; exit 1; }
@@ -148,7 +172,7 @@ jobs:
       - name: The sitemap is intact
         run: |
           set -uo pipefail
-          code=$(curl -sS -o /tmp/sm.xml -w '%{http_code}' --max-time 30 \
+          code=$(curl -sS $ORIGIN -o /tmp/sm.xml -w '%{http_code}' --max-time 30 \
                  "https://artificialwatch.com/aw-sitemap.xml?cb=${GITHUB_RUN_ID}")
           urls=$(grep -c '<loc>' /tmp/sm.xml || true)
           echo "http=$code urls=$urls"
